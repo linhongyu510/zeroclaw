@@ -9521,7 +9521,7 @@ impl RpcDispatcher {
             ));
         }
         config
-            .set_prop_persistent(prop, &value_str)
+            .set_prop_persistent_validated(prop, &value_str)
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
     }
 
