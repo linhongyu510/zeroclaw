@@ -9279,7 +9279,7 @@ impl RpcDispatcher {
         // the heap rather than inflating this async fn's stack frame across the
         // awaits below.
         let mut config = Box::new(old_config.clone());
-        Self::stage_config_set(&mut config, &req.prop, &req.value)?;
+        Self::stage_config_set_validated(&mut config, &req.prop, &req.value, true)?;
         let effects = RpcConfigCommitEffects {
             config_reservations: _agent_config_reservation.into_iter().collect(),
             memory_provider_refs: refresh_model_provider_ref.into_iter().collect(),
@@ -9429,19 +9429,20 @@ impl RpcDispatcher {
         )?;
         let mut config = old_config.clone();
         for (index, entry) in req.sets.iter().enumerate() {
-            Self::stage_config_set(&mut config, &entry.prop, &entry.value).map_err(|e| {
-                rpc_err(
-                    e.code,
-                    crate::i18n::get_required_cli_string_with_args(
-                        "rpc-config-set-many-entry-rejected",
-                        &[
-                            ("index", &index.to_string()),
-                            ("prop", &entry.prop),
-                            ("reason", &e.message),
-                        ],
-                    ),
-                )
-            })?;
+            Self::stage_config_set_validated(&mut config, &entry.prop, &entry.value, false)
+                .map_err(|e| {
+                    rpc_err(
+                        e.code,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "rpc-config-set-many-entry-rejected",
+                            &[
+                                ("index", &index.to_string()),
+                                ("prop", &entry.prop),
+                                ("reason", &e.message),
+                            ],
+                        ),
+                    )
+                })?;
         }
         // The request paths describe the affected live views; the candidate
         // config remains their canonical source. Prepare all affected sessions
@@ -9485,10 +9486,11 @@ impl RpcDispatcher {
     /// coerce the polymorphic value, refuse a masked or empty secret, and
     /// apply the persistent write. Never touches the live config or disk;
     /// the caller commits the working copy, or drops it on error.
-    fn stage_config_set(
+    fn stage_config_set_validated(
         config: &mut Config,
         prop: &str,
         value: &Value,
+        validate: bool,
     ) -> Result<(), JsonRpcError> {
         if config.ensure_map_key_for_path(prop) {
             // Refused to vivify the reserved `default` agent: return a
@@ -9526,9 +9528,15 @@ impl RpcDispatcher {
                 format!("Refusing to overwrite secret `{prop}` with a masked or empty value"),
             ));
         }
-        config
-            .set_prop_persistent_validated(prop, &value_str)
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
+        if validate {
+            config
+                .set_prop_persistent_validated(prop, &value_str)
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
+        } else {
+            config
+                .set_prop_persistent(prop, &value_str)
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
+        }
     }
 
     fn refresh_memory_embedder_for_model_provider(
