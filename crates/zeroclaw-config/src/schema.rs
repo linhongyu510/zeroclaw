@@ -26173,6 +26173,51 @@ impl Config {
         }
     }
 
+    fn validate_edited_route_required_field(&self, path: &str) -> Result<()> {
+        let Some((kind, hint, field)) = Self::route_required_field(path) else {
+            return Ok(());
+        };
+        let values = self.route_index(kind, hint).and_then(|index| match kind {
+            "model_routes" => self
+                .model_routes
+                .get(index)
+                .map(|route| (&route.model_provider, &route.model)),
+            "embedding_routes" => self
+                .embedding_routes
+                .get(index)
+                .map(|route| (&route.model_provider, &route.model)),
+            _ => None,
+        });
+        let Some((provider, model)) = values else {
+            validation_bail!(DanglingReference, path, "{kind}.{hint} is not configured");
+        };
+        let value = if field == "model" { model } else { provider }.trim();
+        if value.is_empty() {
+            validation_bail!(RequiredFieldEmpty, path, "{path} must not be empty");
+        }
+        if field == "model_provider" {
+            // Whole-config validation can stop at an incomplete sibling before
+            // reaching this route. Judge the edited reference independently.
+            match value.split_once('.') {
+                Some((family, alias)) if !family.is_empty() && !alias.is_empty() => {
+                    if self.providers.models.find(family, alias).is_none() {
+                        validation_bail!(
+                            DanglingReference,
+                            path,
+                            "{path} = {value:?} does not reference a configured model provider"
+                        );
+                    }
+                }
+                _ => validation_bail!(
+                    InvalidFormat,
+                    path,
+                    "{path} must be dotted form `<type>.<alias>` (got {value:?})"
+                ),
+            }
+        }
+        Ok(())
+    }
+
     fn validate_edited_agent_required_reference(&self, path: &str) -> Result<()> {
         let Some((alias, field)) = Self::agent_required_field(path) else {
             return Ok(());
@@ -26259,6 +26304,7 @@ impl Config {
         let mut candidate = self.clone();
         candidate.set_prop_persistent(name, value_str)?;
         candidate.validate_edited_agent_required_reference(name)?;
+        candidate.validate_edited_route_required_field(name)?;
         if let Err(error) = candidate.validate() {
             let api_error = crate::api_error::ConfigApiError::from_validation(error);
             if !self.is_complementary_required_agent_field(name, &api_error) {
@@ -31526,6 +31572,86 @@ enabled = true
             .expect_err("a dangling route provider must be rejected even while staged");
         assert!(err.to_string().contains("nope.missing"));
         assert_eq!(config.model_routes[0].model_provider, "");
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_rejects_bad_route_with_incomplete_sibling() {
+        for kind in ["model_routes", "embedding_routes"] {
+            for (field, value) in [
+                ("model_provider", "nope.missing"),
+                ("model_provider", "openai.missing"),
+                ("model_provider", "not-dotted"),
+                ("model_provider", ""),
+                ("model", "   "),
+            ] {
+                let mut config: Config = toml::from_str(&format!(
+                    r#"
+                        [providers.models.openai.primary]
+                        api_key = "test-key"
+                        model = "gpt-test"
+
+                        [[{kind}]]
+                        hint = "alpha"
+
+                        [[{kind}]]
+                        hint = "beta"
+                        model_provider = "openai.primary"
+                        model = "gpt-test"
+                    "#
+                ))
+                .unwrap();
+                config.mark_dirty("gateway.port");
+                let before = toml::to_string(&config).unwrap();
+                let dirty_before = config.dirty_paths.clone();
+                let path = format!("{kind}.beta.{field}");
+
+                let error = config
+                    .set_prop_persistent_validated(&path, value)
+                    .expect_err("an incomplete sibling must not hide an invalid edited field");
+
+                assert!(error.to_string().contains(&path), "{kind}: {error}");
+                assert_eq!(toml::to_string(&config).unwrap(), before, "{path}");
+                assert_eq!(config.dirty_paths, dirty_before, "{path}");
+            }
+        }
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_repairs_route_with_incomplete_sibling() {
+        for kind in ["model_routes", "embedding_routes"] {
+            for fields in [
+                [("model_provider", "openai.primary"), ("model", "gpt-test")],
+                [("model", "gpt-test"), ("model_provider", "openai.primary")],
+            ] {
+                let mut config: Config = toml::from_str(&format!(
+                    r#"
+                        [providers.models.openai.primary]
+                        api_key = "test-key"
+                        model = "gpt-test"
+
+                        [[{kind}]]
+                        hint = "alpha"
+
+                        [[{kind}]]
+                        hint = "beta"
+                    "#
+                ))
+                .unwrap();
+                for (field, value) in fields {
+                    let path = format!("{kind}.beta.{field}");
+                    config
+                        .set_prop_persistent_validated(&path, value)
+                        .expect("a valid staged write must tolerate an incomplete sibling");
+                    assert!(config.dirty_paths.contains(&path));
+                }
+                let routes = toml::Value::try_from(&config).unwrap();
+                let routes = routes[kind].as_array().unwrap();
+                assert_eq!(routes[0]["model_provider"].as_str(), Some(""));
+                assert_eq!(routes[0]["model"].as_str(), Some(""));
+                assert_eq!(routes[1]["model_provider"].as_str(), Some("openai.primary"));
+                assert_eq!(routes[1]["model"].as_str(), Some("gpt-test"));
+            }
+        }
     }
 
     #[test]
