@@ -9660,8 +9660,13 @@ Add pricing to the active provider profile or supply a catalog entry."
                         config.prop_fields().into_iter().map(|f| f.name).collect();
                     path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
                 }
-                config.set_prop_persistent_validated(&path, &selected_value)?;
+                let pre_existing = config.set_prop_persistent_validated(&path, &selected_value)?;
                 Box::pin(config.save_dirty()).await?;
+                if let Some(warning) = pre_existing {
+                    eprintln!(
+                        "warning: config still has a pre-existing validation error: {warning}"
+                    );
+                }
                 if let Some(c) = comment.as_ref()
                     && !c.is_empty()
                 {

@@ -9279,7 +9279,8 @@ impl RpcDispatcher {
         // the heap rather than inflating this async fn's stack frame across the
         // awaits below.
         let mut config = Box::new(old_config.clone());
-        Self::stage_config_set_validated(&mut config, &req.prop, &req.value, true)?;
+        let validation_warning =
+            Self::stage_config_set_validated(&mut config, &req.prop, &req.value, true)?;
         let effects = RpcConfigCommitEffects {
             config_reservations: _agent_config_reservation.into_iter().collect(),
             memory_provider_refs: refresh_model_provider_ref.into_iter().collect(),
@@ -9313,6 +9314,7 @@ impl RpcDispatcher {
         to_result(ConfigSetResult {
             prop: req.prop,
             set: true,
+            pre_existing_validation_error: validation_warning,
         })
     }
 
@@ -9491,7 +9493,7 @@ impl RpcDispatcher {
         prop: &str,
         value: &Value,
         validate: bool,
-    ) -> Result<(), JsonRpcError> {
+    ) -> Result<Option<String>, JsonRpcError> {
         if config.ensure_map_key_for_path(prop) {
             // Refused to vivify the reserved `default` agent: return a
             // reserved error rather than a downstream "Unknown property".
@@ -9532,10 +9534,12 @@ impl RpcDispatcher {
             config
                 .set_prop_persistent_validated(prop, &value_str)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
+                .map(|warning| warning.map(|w| format!("{w}")))
         } else {
             config
                 .set_prop_persistent(prop, &value_str)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))
+                .map(|()| None)
         }
     }
 

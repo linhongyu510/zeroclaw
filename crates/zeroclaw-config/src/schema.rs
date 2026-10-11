@@ -26296,37 +26296,89 @@ impl Config {
         matches!(field, "model_provider" | "risk_profile").then_some((agent, field))
     }
 
+    /// Whether the error path names the same `agents.<alias>` entry that `edited_path` edits.
+    ///
+    /// Errors on a sibling field of the agent being edited keep the old refusal: the agent's
+    /// required references are coupled. A error on a *different* agent, or anywhere outside
+    /// `agents.*`, is unrelated and must not wedge this write.
+    fn error_in_same_agent_namespace(edited_path: &str, error_path: Option<&str>) -> bool {
+        let Some(error_path) = error_path else {
+            return false;
+        };
+        let edited_agent = edited_path
+            .strip_prefix("agents.")
+            .and_then(|rest| rest.split('.').next());
+        let error_agent = error_path
+            .strip_prefix("agents.")
+            .and_then(|rest| rest.split('.').next());
+        matches!((edited_agent, error_agent), (Some(a), Some(b)) if a == b)
+    }
+
     /// Apply and validate a persistent property update atomically.
     ///
     /// Validation runs on a working copy so a rejected value cannot mutate the
     /// live config or leave a dirty path behind.
-    pub fn set_prop_persistent_validated(&mut self, name: &str, value_str: &str) -> Result<()> {
+    ///
+    /// The write is refused only when the resulting error belongs to the path
+    /// being edited (or has no path it can be attributed to), is a pathless
+    /// error, is on the same agent being edited, or fails the staged companion
+    /// probe. A pre-existing validation error on an unrelated section does not
+    /// hold up the write: the candidate is installed and that error is returned
+    /// as a warning, so the boot-time repair surface (`config set`) is not
+    /// wedged by an error elsewhere in the file. Staged agent and route
+    /// completion keeps its companion-field exception.
+    pub fn set_prop_persistent_validated(
+        &mut self,
+        name: &str,
+        value_str: &str,
+    ) -> Result<Option<crate::api_error::ConfigApiError>> {
         let mut candidate = self.clone();
         candidate.set_prop_persistent(name, value_str)?;
         candidate.validate_edited_agent_required_reference(name)?;
         candidate.validate_edited_route_required_field(name)?;
+        let edited_paths = std::collections::HashSet::from([name.to_string()]);
+        let mut pre_existing_warning = None;
         if let Err(error) = candidate.validate() {
             let api_error = crate::api_error::ConfigApiError::from_validation(error);
-            if !self.is_complementary_required_agent_field(name, &api_error) {
+            let complementary = self.is_complementary_required_agent_field(name, &api_error);
+            let pathless = api_error.path.as_deref().map(str::is_empty).unwrap_or(true);
+            let touches_edited = api_error.touches_any_path(&edited_paths);
+            if !complementary && (pathless || touches_edited) {
+                // The error belongs to the write itself, or has no path to
+                // attribute it to: fail closed and refuse.
                 return Err(anyhow::Error::new(api_error));
             }
-            // The surfaced error is a still-empty complementary field on the
-            // same agent, so staged repair may proceed. But `validate()` stops
-            // at its first error, and that error says nothing about the value
-            // just written. Re-validate with the complementary field filled in
-            // so any error belonging to *this* write -- a dangling reference,
-            // say -- is not waved through by the exception above.
-            if let Some(probe) = candidate.probe_with_complementary_agent_fields_filled(name)
-                && let Err(error) = probe.validate()
-            {
-                let api_error = crate::api_error::ConfigApiError::from_validation(error);
-                if !self.is_complementary_required_agent_field(name, &api_error) {
-                    return Err(anyhow::Error::new(api_error));
+            if complementary {
+                // The surfaced error is a still-empty companion field on the
+                // entry being authored, so staged repair may proceed. But
+                // `validate()` stops at its first error, and that error says
+                // nothing about the value just written. Re-validate with the
+                // companion fields filled in so any error belonging to *this*
+                // write -- a dangling reference, say -- is not waved through.
+                if let Some(probe) = candidate.probe_with_complementary_agent_fields_filled(name)
+                    && let Err(error) = probe.validate()
+                {
+                    let probe_error = crate::api_error::ConfigApiError::from_validation(error);
+                    if !self.is_complementary_required_agent_field(name, &probe_error) {
+                        return Err(anyhow::Error::new(probe_error));
+                    }
                 }
+            } else if Self::error_in_same_agent_namespace(name, api_error.path.as_deref()) {
+                // An error on another field of the same agent being edited still
+                // refuses: the agent's required references are coupled, and an
+                // edit such as enabling the agent must not wave through its own
+                // empty reference. Only errors on unrelated sections are warned.
+                return Err(anyhow::Error::new(api_error));
+            } else {
+                // A pre-existing error on an unrelated section: the edited value
+                // is valid, so install it and surface the old error as a warning
+                // rather than holding the write hostage to state that was already
+                // broken before this edit.
+                pre_existing_warning = Some(api_error);
             }
         }
         *self = candidate;
-        Ok(())
+        Ok(pre_existing_warning)
     }
 
     /// Clones `self` with every empty agent required field filled with a
@@ -31876,6 +31928,93 @@ enabled = true
 
         assert!(err.to_string().contains("agents.worker.risk_profile"));
         assert_eq!(toml::to_string(&config.agents).unwrap(), agents_before);
+        assert_eq!(config.dirty_paths, dirty_before);
+    }
+
+    #[test]
+    async fn set_prop_repairs_unrelated_preexisting_errors_one_at_a_time() {
+        // Two pre-existing validation errors on unrelated sections must not
+        // deadlock `config set`: each repair installs and surfaces the other
+        // remaining error as a warning until the file is fully consistent.
+        let mut config: Config = toml::from_str(
+            r#"
+                [gateway]
+                websocket_ping_interval_secs = 999999
+
+                [scheduler]
+                max_concurrent = 0
+            "#,
+        )
+        .unwrap();
+
+        // First write repairs the scheduler error; the gateway error remains and
+        // comes back as a warning.
+        let warning = config
+            .set_prop_persistent_validated("scheduler.max_concurrent", "4")
+            .expect("a valid repair must not be refused by an unrelated error")
+            .expect("the unrelated gateway error is surfaced as a warning");
+        assert_eq!(
+            warning.path.as_deref(),
+            Some("gateway.websocket_ping_interval_secs")
+        );
+        assert_eq!(config.scheduler.max_concurrent, 4);
+
+        // Now repair the gateway error; nothing should remain.
+        let resolved = config
+            .set_prop_persistent_validated("gateway.websocket_ping_interval_secs", "30")
+            .expect("repairing the last unrelated error must succeed");
+        assert!(
+            resolved.is_none(),
+            "config should be fully valid after both repairs"
+        );
+        config.validate().expect("config valid after both repairs");
+    }
+
+    #[test]
+    async fn set_prop_allows_unrelated_write_with_existing_error() {
+        // A write to one section must succeed while an unrelated section is
+        // still invalid; the unrelated error is reported, not held against the
+        // valid write.
+        let mut config: Config = toml::from_str(
+            r#"
+                [gateway]
+                port = 8080
+                websocket_ping_interval_secs = 999999
+            "#,
+        )
+        .unwrap();
+
+        let warning = config
+            .set_prop_persistent_validated("gateway.port", "12345")
+            .expect("a valid unrelated write must not be refused")
+            .expect("the pre-existing ping-interval error is surfaced as a warning");
+        assert_eq!(
+            warning.path.as_deref(),
+            Some("gateway.websocket_ping_interval_secs")
+        );
+        assert_eq!(config.gateway.port, 12345);
+    }
+
+    #[test]
+    async fn set_prop_rejects_bad_edited_value_despite_unrelated_error() {
+        // A bad value on the field being edited is still refused even when
+        // another, unrelated section is already invalid.
+        let mut config: Config = toml::from_str(
+            r#"
+                [scheduler]
+                max_concurrent = 0
+            "#,
+        )
+        .unwrap();
+        let dirty_before = config.dirty_paths.clone();
+
+        let err = config
+            .set_prop_persistent_validated("gateway.websocket_ping_interval_secs", "999999")
+            .expect_err("a value out of range on the edited field must be refused");
+        assert!(
+            err.to_string()
+                .contains("gateway.websocket_ping_interval_secs")
+        );
         assert_eq!(config.dirty_paths, dirty_before);
     }
 
