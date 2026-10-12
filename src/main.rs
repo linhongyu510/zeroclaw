@@ -9663,6 +9663,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 let pre_existing = config.set_prop_persistent_validated(&path, &selected_value)?;
                 Box::pin(config.save_dirty()).await?;
                 if let Some(warning) = pre_existing {
+                    // i18n-exempt: developer-facing config validation warning, not user-facing copy
                     eprintln!(
                         "warning: config still has a pre-existing validation error: {warning}"
                     );
