@@ -26394,17 +26394,25 @@ impl Config {
     ///
     /// `validate()` stops at its first error, so an earlier pre-existing error can
     /// hide an invalid edited value. This clones the candidate and, for each error
-    /// that is *not* on the edited path, resets that field to its shipped default
-    /// and re-validates. It stops when validation passes (the edited value is fine)
-    /// or surfaces an error on the edited path (the edited value is bad). Returns
-    /// `None` when the edited value cannot be faulted in this probe.
+    /// that is *not* on the edited path, neutralizes that field and re-validates.
+    /// It stops when validation passes (the edited value is fine) or surfaces an
+    /// error on the edited path (the edited value is bad). Returns `None` when the
+    /// edited value cannot be faulted in this probe.
+    ///
+    /// Numeric pre-existing fields are neutralized to `1` rather than to their
+    /// shipped default: a large default can itself trip a cross-field check against
+    /// the edited value (e.g. resetting `mdns.announce_interval_secs` to 30 makes a
+    /// valid `peer_ttl_secs = 25` look like a violation, even though 25 > 0 holds
+    /// against the caller's actual zero). `1` clears the field's own out-of-zero
+    /// error while being the least likely value to manufacture a new rejection.
     fn edited_value_rejected_behind_preexisting_errors(
         candidate: &Self,
         edited_paths: &std::collections::HashSet<String>,
     ) -> Option<crate::api_error::ConfigApiError> {
+        use crate::api_error::ConfigApiCode;
         use crate::api_error::ConfigApiError;
         let default = Self::default();
-        let default_value = |path: &str| -> Option<String> {
+        let neutral_value = |path: &str| -> Option<String> {
             let value = serde_json::to_value(&default).ok()?;
             let mut cur = &value;
             for seg in path.split('.') {
@@ -26412,7 +26420,9 @@ impl Config {
             }
             match cur {
                 serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Number(n) => Some(n.to_string()),
+                // Minimally-permissive: clear the field's own error without
+                // substituting a large default that changes cross-field math.
+                serde_json::Value::Number(_) => Some("1".to_string()),
                 serde_json::Value::Bool(b) => Some(b.to_string()),
                 _ => None,
             }
@@ -26426,9 +26436,17 @@ impl Config {
                     if api.touches_any_path(edited_paths) {
                         return Some(api);
                     }
+                    // Only numeric/range pre-existing errors are safe to neutralize
+                    // with a placeholder; pathless or enum/reference errors we
+                    // cannot repair without guessing, so defer to the caller.
+                    if api.code != ConfigApiCode::InvalidNumericRange
+                        && api.code != ConfigApiCode::RequiredFieldEmpty
+                    {
+                        return None;
+                    }
                     let path = api.path.clone()?;
-                    let default_v = default_value(&path)?;
-                    probe.set_prop(&path, &default_v).ok()?;
+                    let neutral = neutral_value(&path)?;
+                    probe.set_prop(&path, &neutral).ok()?;
                 }
             }
         }
@@ -32074,6 +32092,34 @@ enabled = true
         assert!(err.to_string().contains("scheduler.max_concurrent"));
         assert_eq!(config.scheduler.max_concurrent, 8);
         assert_eq!(config.dirty_paths, dirty_before);
+    }
+
+    #[test]
+    async fn set_prop_does_not_false_refuse_edited_value_behind_neutralized_cross_field_error() {
+        // announce_interval_secs == 0 is pre-existing. peer_ttl_secs must be
+        // greater than announce_interval_secs. Neutralizing the zero announce to a
+        // large shipped default (30) would make a valid peer_ttl = 25 look like a
+        // violation (25 > 30 is false). The edited value must be accepted: against
+        // the caller's own announce = 0, 25 > 0 holds, and only the zero announce
+        // needs repair.
+        let mut config: Config = toml::from_str(
+            r#"
+                [nodes.mdns]
+                announce_interval_secs = 0
+                peer_ttl_secs = 20
+            "#,
+        )
+        .unwrap();
+
+        let warning = config
+            .set_prop_persistent_validated("nodes.mdns.peer_ttl_secs", "25")
+            .expect("a valid edited value must proceed behind an unrelated error")
+            .expect("the pre-existing announce_interval error is surfaced as a warning");
+        assert_eq!(
+            warning.path.as_deref(),
+            Some("nodes.mdns.announce_interval_secs")
+        );
+        assert_eq!(config.nodes.mdns.peer_ttl_secs, 25);
     }
 
     #[test]
