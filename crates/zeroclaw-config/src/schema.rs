@@ -26370,15 +26370,69 @@ impl Config {
                 // empty reference. Only errors on unrelated sections are warned.
                 return Err(anyhow::Error::new(api_error));
             } else {
-                // A pre-existing error on an unrelated section: the edited value
-                // is valid, so install it and surface the old error as a warning
-                // rather than holding the write hostage to state that was already
-                // broken before this edit.
+                // A pre-existing error on an unrelated section. validate() stops
+                // at its first error, so it has not yet proven the value just
+                // written is itself valid: a broken earlier section could mask an
+                // invalid edited value. Neutralize the pre-existing errors one by
+                // one in a throwaway probe (resetting each to its shipped default)
+                // until validation either reaches an error on the edited path
+                // (refuse) or passes (the edited value is fine).
+                if let Some(bad) =
+                    Self::edited_value_rejected_behind_preexisting_errors(&candidate, &edited_paths)
+                {
+                    return Err(anyhow::Error::new(bad));
+                }
                 pre_existing_warning = Some(api_error);
             }
         }
         *self = candidate;
         Ok(pre_existing_warning)
+    }
+
+    /// Prove the value just written to `edited_paths` is itself valid, even when
+    /// an unrelated section is already broken.
+    ///
+    /// `validate()` stops at its first error, so an earlier pre-existing error can
+    /// hide an invalid edited value. This clones the candidate and, for each error
+    /// that is *not* on the edited path, resets that field to its shipped default
+    /// and re-validates. It stops when validation passes (the edited value is fine)
+    /// or surfaces an error on the edited path (the edited value is bad). Returns
+    /// `None` when the edited value cannot be faulted in this probe.
+    fn edited_value_rejected_behind_preexisting_errors(
+        candidate: &Self,
+        edited_paths: &std::collections::HashSet<String>,
+    ) -> Option<crate::api_error::ConfigApiError> {
+        use crate::api_error::ConfigApiError;
+        let default = Self::default();
+        let default_value = |path: &str| -> Option<String> {
+            let value = serde_json::to_value(&default).ok()?;
+            let mut cur = &value;
+            for seg in path.split('.') {
+                cur = cur.get(seg)?;
+            }
+            match cur {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                serde_json::Value::Bool(b) => Some(b.to_string()),
+                _ => None,
+            }
+        };
+        let mut probe = candidate.clone();
+        for _ in 0..64 {
+            match probe.validate() {
+                Ok(_) => return None,
+                Err(e) => {
+                    let api = ConfigApiError::from_validation(e);
+                    if api.touches_any_path(edited_paths) {
+                        return Some(api);
+                    }
+                    let path = api.path.clone()?;
+                    let default_v = default_value(&path)?;
+                    probe.set_prop(&path, &default_v).ok()?;
+                }
+            }
+        }
+        None
     }
 
     /// Clones `self` with every empty agent required field filled with a
@@ -31993,6 +32047,59 @@ enabled = true
             Some("gateway.websocket_ping_interval_secs")
         );
         assert_eq!(config.gateway.port, 12345);
+    }
+
+    #[test]
+    async fn set_prop_rejects_invalid_edited_value_behind_earlier_unrelated_error() {
+        // With gateway.websocket_ping_interval_secs already out of range, setting
+        // scheduler.max_concurrent = 0 (itself invalid) must be refused even though
+        // validate() stops at the gateway error first.
+        let mut config: Config = toml::from_str(
+            r#"
+                [gateway]
+                websocket_ping_interval_secs = 999999
+
+                [scheduler]
+                max_concurrent = 8
+            "#,
+        )
+        .unwrap();
+        let dirty_before = config.dirty_paths.clone();
+
+        let err = config
+            .set_prop_persistent_validated("scheduler.max_concurrent", "0")
+            .expect_err(
+                "an invalid edited value must be refused even behind an earlier unrelated error",
+            );
+        assert!(err.to_string().contains("scheduler.max_concurrent"));
+        assert_eq!(config.scheduler.max_concurrent, 8);
+        assert_eq!(config.dirty_paths, dirty_before);
+    }
+
+    #[test]
+    async fn set_prop_allows_valid_edited_value_behind_earlier_unrelated_error() {
+        // Same pre-existing gateway error, but the edited value is itself valid:
+        // the write must proceed and surface the gateway error as a warning.
+        let mut config: Config = toml::from_str(
+            r#"
+                [gateway]
+                websocket_ping_interval_secs = 999999
+
+                [scheduler]
+                max_concurrent = 8
+            "#,
+        )
+        .unwrap();
+
+        let warning = config
+            .set_prop_persistent_validated("scheduler.max_concurrent", "4")
+            .expect("a valid edited value must proceed behind an unrelated error")
+            .expect("the pre-existing gateway error is surfaced as a warning");
+        assert_eq!(
+            warning.path.as_deref(),
+            Some("gateway.websocket_ping_interval_secs")
+        );
+        assert_eq!(config.scheduler.max_concurrent, 4);
     }
 
     #[test]
