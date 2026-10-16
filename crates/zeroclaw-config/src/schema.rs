@@ -26296,22 +26296,75 @@ impl Config {
         matches!(field, "model_provider" | "risk_profile").then_some((agent, field))
     }
 
-    /// Whether the error path names the same `agents.<alias>` entry that `edited_path` edits.
+    /// Decide whether a candidate-side validation error at `target_paths` was
+    /// introduced by the write just applied, or was already failing in the
+    /// pre-write config (`self`).
     ///
-    /// Errors on a sibling field of the agent being edited keep the old refusal: the agent's
-    /// required references are coupled. A error on a *different* agent, or anywhere outside
-    /// `agents.*`, is unrelated and must not wedge this write.
-    fn error_in_same_agent_namespace(edited_path: &str, error_path: Option<&str>) -> bool {
-        let Some(error_path) = error_path else {
-            return false;
+    /// A path only says *where* an error lives, not *whether the write caused
+    /// it*: a sibling field (enabling a channel that then reports an empty
+    /// credential) or another error on the same agent (a second dangling
+    /// reference) looks "unrelated" by namespace but is really this write's own
+    /// doing, or really pre-existing. The pre-write config is the baseline. If
+    /// it already validated, every error the candidate surfaces was introduced by
+    /// this write. If it was already failing, walk past the unrelated errors by
+    /// neutralizing them the same way
+    /// [`edited_value_rejected_behind_preexisting_errors`] does, and return
+    /// `false` once the walk reaches the target as a pre-existing error. A walk
+    /// that cannot neutralize an unrelated error returns `false` too (conservative
+    /// warn), so only a proven-new error refuses the write.
+    fn prewrite_error_introduced(&self, target_paths: &std::collections::HashSet<String>) -> bool {
+        use crate::api_error::{ConfigApiCode, ConfigApiError};
+        // A clean pre-write config owns every error the write now surfaces.
+        if self.validate().is_ok() {
+            return true;
+        }
+        let default = Self::default();
+        let neutral_value = |path: &str| -> Option<String> {
+            let value = serde_json::to_value(&default).ok()?;
+            let mut cur = &value;
+            for seg in path.split('.') {
+                cur = cur.get(seg)?;
+            }
+            match cur {
+                serde_json::Value::String(s) => Some(s.clone()),
+                // Minimally-permissive: clear the field's own error without
+                // substituting a large default that changes cross-field math.
+                serde_json::Value::Number(_) => Some("1".to_string()),
+                serde_json::Value::Bool(b) => Some(b.to_string()),
+                _ => None,
+            }
         };
-        let edited_agent = edited_path
-            .strip_prefix("agents.")
-            .and_then(|rest| rest.split('.').next());
-        let error_agent = error_path
-            .strip_prefix("agents.")
-            .and_then(|rest| rest.split('.').next());
-        matches!((edited_agent, error_agent), (Some(a), Some(b)) if a == b)
+        let mut probe = self.clone();
+        for _ in 0..64 {
+            match probe.validate() {
+                Ok(_) => return true,
+                Err(e) => {
+                    let api = ConfigApiError::from_validation(e);
+                    if api.touches_any_path(target_paths) {
+                        return false;
+                    }
+                    // Only numeric/range and empty-required errors are safe to
+                    // neutralize with a placeholder; anything else (a dangling
+                    // reference, a bad format) we cannot repair without guessing,
+                    // so treat the error as pre-existing and warn.
+                    if api.code != ConfigApiCode::InvalidNumericRange
+                        && api.code != ConfigApiCode::RequiredFieldEmpty
+                    {
+                        return false;
+                    }
+                    let Some(path) = api.path.clone() else {
+                        return false;
+                    };
+                    let Some(neutral) = neutral_value(&path) else {
+                        return false;
+                    };
+                    if probe.set_prop(&path, &neutral).is_err() {
+                        return false;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Apply and validate a persistent property update atomically.
@@ -26319,14 +26372,15 @@ impl Config {
     /// Validation runs on a working copy so a rejected value cannot mutate the
     /// live config or leave a dirty path behind.
     ///
-    /// The write is refused only when the resulting error belongs to the path
-    /// being edited (or has no path it can be attributed to), is a pathless
-    /// error, is on the same agent being edited, or fails the staged companion
-    /// probe. A pre-existing validation error on an unrelated section does not
-    /// hold up the write: the candidate is installed and that error is returned
-    /// as a warning, so the boot-time repair surface (`config set`) is not
-    /// wedged by an error elsewhere in the file. Staged agent and route
-    /// completion keeps its companion-field exception.
+    /// The write is refused only when the resulting error belongs to the write
+    /// itself: it is on the path being edited, is pathless, was introduced by
+    /// the write (the pre-write config validated, or the pre-write walk does
+    /// not already reach that error), or fails the edited-value probe. A
+    /// pre-existing validation error does not hold up the write: the candidate
+    /// is installed and that error is returned as a warning, so the boot-time
+    /// repair surface (`config set`) is not wedged by an error elsewhere in the
+    /// file. Staged agent and route completion keeps its companion-field
+    /// exception.
     pub fn set_prop_persistent_validated(
         &mut self,
         name: &str,
@@ -26363,20 +26417,21 @@ impl Config {
                         return Err(anyhow::Error::new(probe_error));
                     }
                 }
-            } else if Self::error_in_same_agent_namespace(name, api_error.path.as_deref()) {
-                // An error on another field of the same agent being edited still
-                // refuses: the agent's required references are coupled, and an
-                // edit such as enabling the agent must not wave through its own
-                // empty reference. Only errors on unrelated sections are warned.
-                return Err(anyhow::Error::new(api_error));
             } else {
-                // A pre-existing error on an unrelated section. validate() stops
-                // at its first error, so it has not yet proven the value just
-                // written is itself valid: a broken earlier section could mask an
-                // invalid edited value. Neutralize the pre-existing errors one by
-                // one in a throwaway probe (resetting each to its shipped default)
-                // until validation either reaches an error on the edited path
-                // (refuse) or passes (the edited value is fine).
+                // The error is neither the edited path nor a staged companion
+                // field. Decide whether the write introduced it by diffing
+                // against the pre-write config rather than by path namespace:
+                // a sibling field (enabling a channel) or a second error on the
+                // same agent is either this write's own doing or genuinely
+                // pre-existing, and the pre-write walk tells which.
+                let target =
+                    std::collections::HashSet::from([api_error.path.clone().unwrap_or_default()]);
+                if self.prewrite_error_introduced(&target) {
+                    return Err(anyhow::Error::new(api_error));
+                }
+                // Pre-existing or undecidable: the surfaced error does not hold
+                // up the write, but a bad edited value could still be hidden
+                // behind it. Neutralize unrelated errors to reach the edited path.
                 if let Some(bad) =
                     Self::edited_value_rejected_behind_preexisting_errors(&candidate, &edited_paths)
                 {
@@ -32001,6 +32056,98 @@ enabled = true
         assert!(err.to_string().contains("agents.worker.risk_profile"));
         assert_eq!(toml::to_string(&config.agents).unwrap(), agents_before);
         assert_eq!(config.dirty_paths, dirty_before);
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_rejects_enabling_voice_call_without_account_id() {
+        // Enabling a `channels.voice_call.<alias>` block whose `account_id` is
+        // empty must be refused even though the error path (`account_id`) is a
+        // sibling of the path being edited (`enabled`). On an otherwise-valid
+        // config the pre-write state validated, so the write introduced the
+        // required-field error; deciding by path namespace would mislabel it as
+        // "pre-existing" and save a channel the supervisor would crashloop on.
+        let mut config: Config = toml::from_str(
+            r#"
+                [channels.voice_call.main]
+                enabled = false
+                account_id = ""
+                auth_token = ""
+                from_number = ""
+            "#,
+        )
+        .unwrap();
+        assert!(
+            config.validate().is_ok(),
+            "a disabled partial voice_call block must validate"
+        );
+        let vc_before = toml::to_string(&config.channels.voice_call).unwrap();
+        let dirty_before = config.dirty_paths.clone();
+
+        let err = config
+            .set_prop_persistent_validated("channels.voice_call.main.enabled", "true")
+            .expect_err("enabling voice_call without an account_id must be refused");
+
+        assert!(
+            err.to_string()
+                .contains("channels.voice_call.main.account_id")
+        );
+        assert_eq!(
+            toml::to_string(&config.channels.voice_call).unwrap(),
+            vc_before
+        );
+        assert_eq!(config.dirty_paths, dirty_before);
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_repairs_two_dangling_refs_in_one_agent_sequentially() {
+        // An agent with two independent dangling references must be repairable
+        // one `config set` at a time. On the path-namespace rule, clearing
+        // either one left the other dangling reference, which the same-agent
+        // branch refused — a deadlock. The pre-write diff treats the
+        // still-dangling sibling as pre-existing and warns instead.
+        let mut config: Config = toml::from_str(
+            r#"
+                [providers.models.openai.primary]
+                api_key = "test-key"
+                model = "gpt-test"
+
+                [risk_profiles.standard]
+                level = "supervised"
+
+                [agents.alpha]
+                enabled = true
+                model_provider = "openai.primary"
+                risk_profile = "standard"
+                channels = ["telegram.missing"]
+                tts_provider = "openai.missing"
+            "#,
+        )
+        .unwrap();
+        assert!(
+            config.validate().is_err(),
+            "both dangling refs should fail validation"
+        );
+
+        // First repair: clear the dangling tts_provider. The channels ref is
+        // still dangling and comes back as a warning rather than refusing the
+        // write.
+        let warning = config
+            .set_prop_persistent_validated("agents.alpha.tts_provider", "")
+            .expect("clearing one dangling ref must not be refused by the other")
+            .expect("the still-dangling channels ref is surfaced as a warning");
+        assert_eq!(warning.path.as_deref(), Some("agents.alpha.channels[0]"));
+        assert_eq!(config.agents["alpha"].tts_provider, "");
+
+        // Second repair: clear the dangling channels. The config is now
+        // consistent.
+        let resolved = config
+            .set_prop_persistent_validated("agents.alpha.channels", "[]")
+            .expect("clearing the remaining dangling ref must succeed");
+        assert!(
+            resolved.is_none(),
+            "config should be valid after both repairs"
+        );
+        config.validate().expect("config valid after both repairs");
     }
 
     #[test]
