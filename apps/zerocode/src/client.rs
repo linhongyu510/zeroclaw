@@ -89,6 +89,7 @@ pub mod method {
     pub const CONFIG_LIST: &str = "config/list";
     pub const CONFIG_SET: &str = "config/set";
     pub const CONFIG_VALIDATE: &str = "config/validate";
+    pub const CONFIG_STATUS: &str = "config/status";
     pub const CONFIG_DELETE: &str = "config/delete";
     pub const CONFIG_RELOAD: &str = "config/reload";
     pub const CONFIG_MAP_KEYS: &str = "config/map-keys";
@@ -283,9 +284,12 @@ pub enum SessionUpdate {
     /// `max_context_tokens` is the preemptive-trim budget the bar fills toward;
     /// `model_context_window` is the model's full capacity, used as the bar
     /// denominator when present so the trim budget can be drawn as a marker.
+    /// `input_tokens_source` is the provenance of `input_tokens` ("provider" or
+    /// "estimate"); an estimated count must be rendered as approximate.
     ContextUsage {
         session_id: String,
         input_tokens: Option<u64>,
+        input_tokens_source: Option<String>,
         max_context_tokens: Option<u64>,
         model_context_window: Option<u64>,
     },
@@ -402,6 +406,10 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
         "context_usage" => Some(SessionUpdate::ContextUsage {
             session_id: sid,
             input_tokens: params.get("input_tokens").and_then(|v| v.as_u64()),
+            input_tokens_source: params
+                .get("input_tokens_source")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             max_context_tokens: params.get("max_context_tokens").and_then(|v| v.as_u64()),
             model_context_window: params.get("model_context_window").and_then(|v| v.as_u64()),
         }),
@@ -585,6 +593,35 @@ impl fmt::Display for DaemonInitializeTimeout {
 }
 
 impl std::error::Error for DaemonInitializeTimeout {}
+
+/// A single RPC did not get a reply within its client-side deadline. The
+/// connection is still up; the daemon is busy or wedged on this method.
+/// Callers that own a UI surface should report this and stay alive — a
+/// stalled `config/list` is not a reason to exit the TUI.
+#[derive(Debug)]
+pub struct DaemonRpcTimeout {
+    pub method: String,
+    pub timeout: Duration,
+}
+
+impl DaemonRpcTimeout {
+    pub fn from_anyhow(error: &anyhow::Error) -> Option<&Self> {
+        error.downcast_ref::<Self>()
+    }
+}
+
+impl fmt::Display for DaemonRpcTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "RPC {}: timed out after {}s",
+            self.method,
+            self.timeout.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for DaemonRpcTimeout {}
 
 #[derive(Debug)]
 pub(crate) struct InitializeResponse {
@@ -2173,12 +2210,15 @@ impl RpcClient {
         let result = tokio::time::timeout(timeout, self.rpc.request(method, params))
             .await
             .map_err(|_| {
-                anyhow::Error::msg(format!(
-                    "RPC {method}: timed out after {}s",
-                    timeout.as_secs()
-                ))
+                anyhow::Error::new(DaemonRpcTimeout {
+                    method: method.to_string(),
+                    timeout,
+                })
             })?
-            .map_err(|e| anyhow::Error::msg(format!("RPC {method}: {} ({})", e.message, e.code)))?;
+            .map_err(|e| {
+                let message = format!("RPC {method}: {} ({})", e.message, e.code);
+                anyhow::Error::new(e).context(message)
+            })?;
         serde_json::from_value(result).with_context(|| format!("deserializing {method} result"))
     }
 
@@ -2313,14 +2353,17 @@ impl RpcClient {
         Ok(result.entries)
     }
 
-    pub async fn config_set(&self, prop: &str, value: Value) -> Result<()> {
-        let _: ConfigSetResult = self
+    pub async fn config_set(&self, prop: &str, value: Value) -> Result<ConfigSetOutcome> {
+        let result: ConfigSetResult = self
             .call(
                 method::CONFIG_SET,
                 serde_json::json!({ "prop": prop, "value": value }),
             )
             .await?;
-        Ok(())
+        Ok(ConfigSetOutcome {
+            revision: result.revision,
+            pre_existing_validation_error: result.pre_existing_validation_error,
+        })
     }
 
     pub async fn config_validate(&self, agent: Option<&str>) -> Result<ConfigValidateResult> {
@@ -2331,11 +2374,23 @@ impl RpcClient {
         .await
     }
 
-    pub async fn config_delete(&self, prop: &str) -> Result<()> {
-        let _: ConfigDeleteResult = self
+    pub async fn config_delete(
+        &self,
+        prop: &str,
+    ) -> Result<Option<crate::wire::PublishedConfigRevision>> {
+        let result: ConfigDeleteResult = self
             .call(method::CONFIG_DELETE, serde_json::json!({ "prop": prop }))
             .await?;
-        Ok(())
+        Ok(result.revision)
+    }
+
+    pub async fn config_status(&self) -> Result<crate::wire::ConfigStatusResult> {
+        self.call_with_timeout(
+            method::CONFIG_STATUS,
+            serde_json::json!({}),
+            std::time::Duration::from_secs(3),
+        )
+        .await
     }
 
     /// Signal the daemon to reload in place. Mirrors `POST /admin/reload`.
@@ -2394,24 +2449,32 @@ impl RpcClient {
         Ok(result.values)
     }
 
-    pub async fn config_map_key_create(&self, path: &str, key: &str) -> Result<()> {
-        let _: Value = self
+    pub async fn config_map_key_create(
+        &self,
+        path: &str,
+        key: &str,
+    ) -> Result<ConfigMapKeyMutationResult> {
+        let result: ConfigMapKeyMutationResult = self
             .call(
                 method::CONFIG_MAP_KEY_CREATE,
                 serde_json::json!({ "path": path, "key": key }),
             )
             .await?;
-        Ok(())
+        Ok(result)
     }
 
-    pub async fn config_map_key_delete(&self, path: &str, key: &str) -> Result<()> {
-        let _: Value = self
+    pub async fn config_map_key_delete(
+        &self,
+        path: &str,
+        key: &str,
+    ) -> Result<ConfigMapKeyMutationResult> {
+        let result: ConfigMapKeyMutationResult = self
             .call(
                 method::CONFIG_MAP_KEY_DELETE,
                 serde_json::json!({ "path": path, "key": key }),
             )
             .await?;
-        Ok(())
+        Ok(result)
     }
 
     pub async fn config_map_key_rename(
@@ -3170,7 +3233,32 @@ pub struct ConfigListResult {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct ConfigSetResult {}
+pub struct ConfigSetResult {
+    #[serde(default)]
+    pub revision: Option<crate::wire::PublishedConfigRevision>,
+    /// A pre-existing validation error on an unrelated section that did not
+    /// block this write; absent when the whole config validates after the
+    /// write.
+    #[serde(default)]
+    pub pre_existing_validation_error: Option<String>,
+}
+
+/// Outcome of one `config/set` write: the committed publication revision
+/// (when the daemon reports one) plus any pre-existing validation error on an
+/// unrelated section that did not block the write.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigSetOutcome {
+    pub revision: Option<crate::wire::PublishedConfigRevision>,
+    pub pre_existing_validation_error: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ConfigMapKeyMutationResult {
+    #[serde(default, alias = "created", alias = "deleted")]
+    pub changed: bool,
+    #[serde(default)]
+    pub revision: Option<crate::wire::PublishedConfigRevision>,
+}
 
 #[cfg(test)]
 mod initialize_version_tests {
@@ -3265,6 +3353,35 @@ mod initialize_version_tests {
 }
 
 #[cfg(test)]
+mod config_set_result_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_pre_existing_validation_error_alongside_revision() {
+        let parsed: ConfigSetResult = serde_json::from_value(json!({
+            "revision": {"epoch": "e", "sequence": 1},
+            "pre_existing_validation_error": "agents.other.model_provider: dangling reference"
+        }))
+        .unwrap();
+        assert!(parsed.revision.is_some());
+        assert_eq!(
+            parsed.pre_existing_validation_error.as_deref(),
+            Some("agents.other.model_provider: dangling reference")
+        );
+    }
+
+    #[test]
+    fn missing_pre_existing_validation_error_defaults_to_none() {
+        let parsed: ConfigSetResult = serde_json::from_value(json!({
+            "revision": {"epoch": "e", "sequence": 1}
+        }))
+        .unwrap();
+        assert!(parsed.pre_existing_validation_error.is_none());
+    }
+}
+
+#[cfg(test)]
 mod initialize_timeout_tests {
     use super::*;
 
@@ -3288,7 +3405,10 @@ mod initialize_timeout_tests {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct ConfigDeleteResult {}
+pub struct ConfigDeleteResult {
+    #[serde(default)]
+    pub revision: Option<crate::wire::PublishedConfigRevision>,
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -6324,10 +6444,52 @@ mod notification_tests {
             parse_session_update(&params),
             Some(SessionUpdate::ContextUsage {
                 session_id,
+                input_tokens_source: None,
                 input_tokens: Some(100_000),
                 max_context_tokens: Some(180_000),
                 model_context_window: Some(200_000),
             }) if session_id == "s-context"
+        ));
+    }
+
+    #[test]
+    fn parse_context_usage_decodes_the_estimate_provenance_marker() {
+        let params = serde_json::json!({
+            "type": "context_usage",
+            "session_id": "s-context",
+            "input_tokens": 4_200,
+            "input_tokens_source": "estimate",
+            "max_context_tokens": 180_000,
+            "model_context_window": 200_000
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::ContextUsage {
+                input_tokens: Some(4_200),
+                ref input_tokens_source,
+                ..
+            }) if input_tokens_source.as_deref() == Some("estimate")
+        ));
+    }
+
+    #[test]
+    fn parse_context_usage_decodes_the_provider_provenance_marker() {
+        let params = serde_json::json!({
+            "type": "context_usage",
+            "session_id": "s-context",
+            "input_tokens": 100_000,
+            "input_tokens_source": "provider",
+            "max_context_tokens": 180_000,
+            "model_context_window": 200_000
+        });
+
+        assert!(matches!(
+            parse_session_update(&params),
+            Some(SessionUpdate::ContextUsage {
+                ref input_tokens_source,
+                ..
+            }) if input_tokens_source.as_deref() == Some("provider")
         ));
     }
 
